@@ -75,7 +75,7 @@ then
 	echo "10s no change!"
 	continue
 else
-	echo "there is som change!"
+	echo "there is some change!"
 	mail_worker
 fi
 

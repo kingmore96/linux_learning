@@ -11,7 +11,7 @@
 chk_disk()
 {
 	# find the full disk,save it to /tmp/ch_disk.log
-	df -m | sed '1d' | sort -rn -k5 | awk '/[2][7]%/ {print $6,$5}' 1> /tmp/ch_disk.log
+	df -m | sed '1d' | sort -rn -k5 | awk '/[9][0-9]%/ {print $6,$5}' 1> /tmp/ch_disk.log
 
 	# cal the lines
 	ch_diskcount=`wc -l /tmp/ch_disk.log | awk '{print $1}'`
