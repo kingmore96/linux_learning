@@ -1,0 +1,82 @@
+#! /bin/bash
+
+# read from /tmp/channel.log per 1 minute and may mail to 466753562@qq.com the content is /tmp/ch_disk.log 
+# logic: read the newest one
+#	if read 0 don't mail
+#	if read 1 need to judge the three situations:
+#		if there is only one line ,mail it and save the timestamp to /tmp/diskmail.log
+#		else
+#		if before is 0 ,mail it immediately.and save the timestamp to /tmp/diskmail.log
+#		if not
+#			read from /tmp/diskmail.log and get the timestamp,find this timestamp from /tmp/channel.log
+# 			and find from that1 to this 1 : judge the channel timestamp and now, if <  30 don't mail 
+#
+#																				 	>= 30 mail,and save the timestamp to /tmp/diskmail.log
+
+mail_worker()
+{
+# read from /tmp/channel.log,if file is not existed,continue.
+if [ ! -f /tmp/channel.log ]
+then
+    continue
+fi
+
+file_count=`wc -l /tmp/channel.log | awk '{print $1}'`
+
+if [ $file_count == 0 ]
+then
+    continue
+fi
+
+new_timestamp=`tail -n1 /tmp/channel.log | awk -F ':' '{print $1}'`
+new_flag=`tail -n1 /tmp/channel.log | awk -F ':' '{print $2}'`
+
+if [ $new_flag == 1 ]
+then
+    if [ $file_count == 1 ]
+    then
+        python /root/sh/mail.py "the used disk is more than 90%" "the most three dir is `cat /tmp/most_disk_dir`"
+        echo `date +%s` >> /tmp/diskmail.log
+    else
+        before_flag=`tail -n2 /tmp/channel.log |head -n1 | awk -F ':' '{print $2}'`
+
+        if [ $before_flag == 0 ]
+        then
+            echo "in mail"
+            python /root/sh/mail.py "the used disk is more than 90%" "the most three dir is `cat /tmp/most_disk_dir`"
+            echo `date +%s` >> /tmp/diskmail.log
+        else
+            lastmail_timestamp=`tail -n1 /tmp/diskmail.log`
+            time_diff=$((10#${new_timestamp}-$((10#${lastmail_timestamp}))))
+            echo "time_diff:$time_diff"
+            if [ $time_diff -gt 1800 ]
+            then
+                python /root/sh/mail.py "the used disk is still more than 90%" "the most three dir is `cat /tmp/most_disk_dir`"
+            fi
+        fi
+    fi
+fi
+}
+
+while :
+do
+
+exec &>> /tmp/mail_exec.log
+
+t=`date +%s`
+echo "$t : this check timestamp"
+old_size=`stat /tmp/channel.log | grep Size | awk '{print $2}'`
+echo "$t : the old size is $old_size"
+sleep 10s
+new_size=`stat /tmp/channel.log | grep Size | awk '{print $2}'`
+
+if [ "$old_size" == "$new_size" ]
+then
+	echo "10s no change!"
+	continue
+else
+	echo "there is som change!"
+	mail_worker
+fi
+
+done

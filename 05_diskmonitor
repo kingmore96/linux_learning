@@ -1,0 +1,57 @@
+#! /bin/bash
+
+# check the disk per minute.
+# if greater than 90% save it to /tmp/ch_disk.log 
+# and write the timestamp and 0(good)/1(bad greater than 90) to /tmp/channel.log,the mail.sh need to read from it,and mail to 466753562@qq.com
+# author : geng
+# version: v0.1
+
+
+# check the disk 
+chk_disk()
+{
+	# find the full disk,save it to /tmp/ch_disk.log
+	df -m | sed '1d' | sort -rn -k5 | awk '/[2][7]%/ {print $6,$5}' 1> /tmp/ch_disk.log
+
+	# cal the lines
+	ch_diskcount=`wc -l /tmp/ch_disk.log | awk '{print $1}'`
+
+	if [ $ch_diskcount -gt 0 ]
+	then
+		tag1=1
+		for disk in `cat /tmp/ch_disk.log | awk '{print $1}'`
+		do
+			find $disk -type d | sed '1d' | xargs du -sh | sort -nr | head -n3 
+		done 1> /tmp/most_disk_dir 			
+	fi
+}
+
+while :
+do
+# execute the check
+chk_disk 
+
+# save to /tmp/channel.log
+if [ $tag1 -eq 1 ] 
+then
+	echo "`date +%s` : 1 " >> /tmp/channel.log
+else
+	echo "`date +%s` : 0 " >> /tmp/channel.log
+fi
+sleep 10s
+done
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
