@@ -1,0 +1,318 @@
+#! /bin/bash
+
+# monitor slave's IO_running and SQL_running,if one is no,read the last_error,judge the common error_code and try to resolve it.
+# save the log to /tmp/check_slave.log,error to /tmp/check_slave.error
+# save the slave status last_error to /tmp/last_error.log
+# if check the error mail it to 466753562@qq.com.
+
+# author : geng
+# version : v0.1
+
+
+# function to resolve 1062 error
+resolve_1062_statementformat(){
+primarykey_value=`grep "Last_Error" /tmp/mysql_ss.log | awk -F "'" '{print $3}'`
+echo "$t:p_value:$primarykey_value"
+db_name=`grep "Last_Error" /tmp/mysql_ss.log | awk -F "'" '{print $8}'`
+echo "$t:db_name:$db_name"
+table_name=`grep "Last_Error" /tmp/mysql_ss.log | awk -F "'" '{print $10}'| awk '{print $3}'| awk -F '(' '{print $1}'`
+echo "$t:table_name:$table_name"
+
+mysql -uroot -p123456 -e "stop slave"
+mysql -uroot -p123456 -e "delete from $db_name.$table_name where id=$primarykey_value"
+mysql -uroot -p123456 -e "start slave"
+
+}
+
+resolve_1062_rowformat(){
+primarykey_value=`grep "Last_Error" /tmp/mysql_ss.log | awk -F ';' '{print $2}'| awk -F "'" '{print $2}'`
+echo "$t:p_value:$primarykey_value"
+db_name=`grep "Last_Error" /tmp/mysql_ss.log | awk -F ';' '{print $1}' | awk '{print $9}' | awk -F "." '{print $1}'`
+echo "$t:db_name:$db_name"
+table_name=`grep "Last_Error" /tmp/mysql_ss.log | awk -F ';' '{print $1}' | awk '{print $9}' | awk -F "." '{print $2}'`
+echo "$t:table_name:$table_name"
+
+mysql -uroot -p123456 -e "stop slave"
+mysql -uroot -p123456 -e "delete from $db_name.$table_name where id=$primarykey_value"
+mysql -uroot -p123456 -e "start slave"
+
+}
+
+# function to resolve 1032 error will not show up in statement format,only in row format
+# delete and update is different to resolve.
+resolve_1032()
+{
+echo "$t:in 1032!"
+# determine delete or update
+up_dele=`grep "Last_Error"  /tmp/mysql_ss.log  | awk '{print $5}'`
+
+if [ $up_dele == "Update_rows" ]
+then
+	resolve_1032_update
+else
+	resolve_1032_delete
+fi
+}
+
+# function to resolve 1032 update error
+resolve_1032_update()
+{
+
+start_pos=`grep Exec_Master_Log_Pos /tmp/mysql_ss.log | awk -F ':' '{print $2}' | awk 'gsub(/^ *| *$/,"")'`
+end_pos=`grep Last_Error /tmp/mysql_ss.log | awk '{print $NF}'`
+echo -e "start_pos:$start_pos\nend_pos:$end_pos" >/tmp/mysql_startendpos.log
+
+cat >/tmp/for_master.sh <<"EOF"
+
+#! /bin/bash	
+
+t=$(date +%F_%T)
+
+echo "$t:in master sh!"
+logfile_name=`find /var -type f -name 'mysql-bin.0*' | xargs ls -t | head -n1`
+echo "$t:log_filename:$logfile_name"
+start_pos=`cat /tmp/mysql_startendpos.log | sed -n '1p' | awk -F ':' '{print $2}'`
+echo "$t:start_pos:$start_pos"
+end_pos=`cat /tmp/mysql_startendpos.log | sed -n '2p' | awk -F ':' '{print $2}'`
+echo "$t:end_pos:$end_pos"
+mysqlbinlog --base64-output=decode-rows -vv --start-position=$start_pos --stop-position=$end_pos $logfile_name >/tmp/mysql_binlog.log
+grep -iE "###" /tmp/mysql_binlog.log >/tmp/mysql_binlog_1.log
+echo "$t:finish /tmp/mysql_binlog_1.log"
+db=$(awk '{print $3}' /tmp/mysql_binlog_1.log | sed -n '1p' | awk -F '`' '{print $2}')
+echo "$t:db:$db"
+table=$(awk '{print $3}' /tmp/mysql_binlog_1.log | sed -n '1p' | awk -F '`' '{print $4}')
+echo "$t:table:$table"
+
+# get all columns,save it to /tmp/mysql_column.log
+mysql -uroot -p123456 -e "select COLUMN_NAME from information_schema.COLUMNS where table_schema='$db' and table_name='$table'" | sed '1d' >/tmp/mysql_column.log
+
+echo "$t:all_column:"
+cat /tmp/mysql_column.log
+
+# concat select and find the row not in slave
+n_column=`wc -l /tmp/mysql_column.log | awk '{print $1}'`
+echo "$t:n_column:$n_column"
+n_log=`wc -l /tmp/mysql_binlog_1.log | awk '{print $1}'`
+echo "$t:n_log:$n_log"
+
+[ -f /tmp/mysql_notin.log ] && rm -rf /tmp/mysql_notin.log
+
+# get all update line and in the circle
+for((i=1;i<=$n_log;i=i+1+(2+2*n_column)))
+do
+	echo "$t:i:$i"
+	cat /tmp/mysql_binlog_1.log | sed -n $i'p'
+	result="select count(*) from $db.$table where "
+	column_i=1
+
+	for((j=i+2;j<i+2+$n_column;j++))
+	do
+		echo "$t:j:$j"
+		cat /tmp/mysql_binlog_1.log | sed -n $j'p'
+		column=`cat /tmp/mysql_column.log | sed -n $column_i'p'`
+		var=$(cat /tmp/mysql_binlog_1.log | sed -n $j'p' | awk -F '/*' '{print $1}' | awk -F '=' '{print $2}' | awk 'gsub(/^ *| *$/,"")')
+		echo "var:$var"		
+		if [ $column_i -eq 1 ]
+		then
+			result=${result}${column}"='"${var}"'"
+		else
+			result=${result}" and "${column}"='"${var}"'"
+		fi
+		echo "result:$result"
+		column_i=$[$column_i+1]
+	done
+
+	mysql_count=`mysql -h192.168.101.138 -utest -pabc -P3306 -e "$result" | sed -n '2p'`
+	echo "$t:mysql_count:$mysql_count"
+	
+	if [ $mysql_count -eq 0 ]
+	then
+		echo "in if!"
+		# save the new record to /tmp/mysql_notin.log
+		echo "=========================" >> /tmp/mysql_notin.log
+		for((m=j+1;m<$j+1+n_column;m++))
+		do
+			echo "m:$m"
+			cat /tmp/mysql_binlog_1.log | sed -n $m'p' | awk -F '/*' '{print $1}' | awk -F '=' '{print $2}' | awk 'gsub(/^ *| *$/,"")' >> /tmp/mysql_notin.log
+		done
+	fi
+	echo "==============="
+done
+
+# echo "==================" >>/tmp/mysql_notin.log
+# echo "9" >>/tmp/mysql_notin.log
+# echo "2019-10-11 11:00:00" >>/tmp/mysql_notin.log
+# echo "13" >>/tmp/mysql_notin.log
+
+
+
+
+
+# concat insert and insert the row to the slave
+echo "$t:start to insert!"
+notin_count=`wc -l /tmp/mysql_notin.log | awk '{print $1}'`
+echo "$t:notin_count:$notin_count"
+echo "$t:n_count:$n_column"
+
+insert="insert into $db.$table("
+# concat insert into XXX(,,,,)
+for((p=1;p<=$n_column;p++))
+do
+	column_insert=`cat /tmp/mysql_column.log | sed -n $p'p'`
+	echo "column_insert:$column_insert"
+    if [ $p -eq $n_column ]
+    then
+        insert=${insert}${column_insert}") values("
+    else
+        insert=${insert}${column_insert}","
+    fi
+done
+    echo "insert:$insert"
+
+# concat values(,,,,,,)
+for((i=1;i<$notin_count;i=i+1+n_column))
+do
+	result_insert=$insert
+	for((j=i+1;j<i+1+$n_column;j++))
+	do
+		cat /tmp/mysql_notin.log | sed -n $j'p'
+		value=`cat /tmp/mysql_notin.log | sed -n $j'p'`
+		if [ $j -eq $[$i+$n_column] ]
+		then
+			result_insert=${result_insert}"'"${value}"')"
+		else
+			result_insert=${result_insert}"'"${value}"',"
+		fi
+		echo "result_insert:$result_insert"
+	done
+
+	mysql -h192.168.101.138 -utest -pabc -P3306 -e "$result_insert"	
+	echo "finished insert!"
+	echo "----------------"
+done
+
+mysql -h192.168.101.138 -utest -pabc -P3306 -e "stop slave"
+mysql -h192.168.101.138 -utest -pabc -P3306 -e "set global slave_exec_mode='IDEMPOTENT'"
+mysql -h192.168.101.138 -utest -pabc -P3306 -e "start slave"
+
+sleep 2s
+
+mysql -h192.168.101.138 -utest -pabc -P3306 -e "stop slave"
+mysql -h192.168.101.138 -utest -pabc -P3306 -e "set global slave_exec_mode='STRICT'"
+mysql -h192.168.101.138 -utest -pabc -P3306 -e "start slave"
+
+EOF
+
+
+scp /tmp/for_master.sh 192.168.101.139:/tmp/
+scp /tmp/mysql_startendpos.log 192.168.101.139:/tmp/
+ssh root@192.168.101.139 "chmod -R 777 /tmp/for_master.sh"
+ssh root@192.168.101.139 "/tmp/for_master.sh"
+
+echo "$t:check it now!"
+
+}
+
+# function to resolve 1032 delete error
+resolve_1032_delete()
+{
+echo "haha"
+
+}
+
+# function to resolve 1452 error
+resolve_1452()
+{
+echo "$t:in 1452!"
+}
+
+
+
+# begin!
+t=`date +%F_%T`
+	
+# exec 1>>/tmp/check_slave.log 2>>/tmp/check_slave.error
+
+# check if the last process is not finished,exit.
+s_name=`echo $0 | awk -F '/' '{print $NF}'`
+ps aux | grep '$s_name' | grep -vE "$$|grep" > /tmp/process.log
+n=`wc -l /tmp/process.log | awk '{print $1}'`
+
+if [ $n -gt 0 ]
+then
+	echo "$t:the last process is running! sh will exit"
+	exit
+fi
+
+# start to check
+echo "$t:start to check!"
+mysql -uroot -p123456 -e "show processlist" >/dev/null
+
+if [ $? -gt 0 ]
+then
+	echo "$t:mysql process is not running!"
+else
+	echo "$t:mysql process is running!"
+	mysql -uroot -p123456 -e "show slave status\G" >/tmp/mysql_ss.log
+	echo "$t:mysql slave status:"
+	cat /tmp/mysql_ss.log 
+	y1=`grep "IO_Running" /tmp/mysql_ss.log | awk -F ':' '{print $2}'`
+	y2=`grep "SQL_Running" /tmp/mysql_ss.log | awk -F ':' '{print $2}'`
+	echo "$t:IO_Running:$y1"
+	echo "$t:SQL_Running:$y2"
+	
+	# SQL_Running no
+	if [ $y1 == "Yes" ] && [ $y2 == "No" ]
+	then
+		grep "Last_Error" /tmp/mysql_ss.log  >/tmp/last_error.log
+		echo "$t:mail it,the error is `cat /tmp/last_error.log`,the sh is try to fix it!"
+		
+		last_error_no=`grep "Last_Errno" /tmp/mysql_ss.log | awk -F ':' '{print $2}'`
+		echo "$t:last_errno:$last_error_no"
+	
+		binlog_format=`mysql -h192.168.101.139 -utest -pabc -P3306 -e "show variables like 'binlog_format'" | sed -n '2p' | awk '{print $2}'`
+		echo "$t:binlog_format:$binlog_format"	
+		
+		if [ $last_error_no == "1062" ]
+		then
+			echo "$t:in 1062 resolve"
+			if [ $binlog_format == "STATEMENT" ]
+			then
+				resolve_1062_statementformat
+			elif [ $binlog_format == "ROW" ]
+			then
+				resolve_1062_rowformat
+			else
+				echo "$t:in $binlog_format!"
+				echo "mail it.please fix it by yourself!"
+			fi
+			echo "$t:fix the 1062 error!"
+		elif [ $last_error_no == "1032" ]
+		then	
+			echo "$t:in 1032 resolve"
+			resolve_1032
+		elif [ $last_error_no == "1452" ]
+		then
+			resolve_1452
+		else
+			echo "$t:mail it,sh can not fix it ,please check it!"
+		fi
+	# IO_Running no or connecting
+	elif [ $y1 != "Yes" ] && [ $y2 == "Yes" ]
+	then
+		echo "$t:mail it the IO have problem!"
+	# both is no
+	elif [ $y1 != "Yes" ] && [ $y2 != "Yes" ]
+	then
+		echo "$t:mail it both have problems!"
+	else
+		echo "$t:mysql slave is running good!" 
+	fi
+fi
+
+echo "$t:end check!"
+echo "=========================================="	
+	
+
+
+
